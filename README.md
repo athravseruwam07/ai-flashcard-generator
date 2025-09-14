@@ -1,8 +1,8 @@
-# 🃏 card Generator (Streamlit + OpenAI)
+# AI Flashcard Generator (Streamlit + OpenAI)
 
 Turn your notes (PDF/DOCX/TXT or pasted text) into **high‑quality Q/A flashcards** you can edit and export to CSV/Anki.
 
-![screenshot placeholder](docs/screenshot.png)
+![screenshot placeholder](image.png)
 
 ## Features
 - Upload **PDF/DOCX/TXT** or paste text
