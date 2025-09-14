@@ -1,7 +1,6 @@
 # app.py
 # modern flashcard generator with in-app study mode
 # fixed: needs-review doesn't inflate count repeatedly; proper state transitions
-# comments are lowercase + friendly
 
 from __future__ import annotations
 
