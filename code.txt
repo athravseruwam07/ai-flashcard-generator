@@ -7,8 +7,6 @@ Below are the exact files to create. Copy each block into files with the same pa
 app.py
 
 # app.py
-# streamlit app for a beginner-friendly ai flashcard generator
-# all comments are lowercase and informal
 
 from __future__ import annotations
 
