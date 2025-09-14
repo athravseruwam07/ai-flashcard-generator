@@ -1,0 +1,7 @@
+streamlit
+pypdf
+python-docx
+python-pptx
+tiktoken
+openai>=1.0.0
+pandas

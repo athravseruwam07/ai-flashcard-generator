@@ -1,0 +1,12 @@
+ollama pull mistral:7b-instruct && \
+export OPENAI_BASE_URL="http://localhost:11434/v1" && \
+export MODEL_NAME="mistral:7b-instruct" && \
+export OPENAI_API_KEY="ollama" && \
+cd ~/Documents/GitHub/ai-flashcard-generator && \
+source .venv/bin/activate && \
+python -m streamlit run app.py --server.maxUploadSize=200
+
+
+APP_BRAND = "FlashcardGPT"
+APP_TAGLINE = "AI-powered tool that transforms notes into test-ready flashcards in seconds."
+NAV_LINK = "athrav-portfolio.vercel.app"  # your portfolio link

@@ -1,0 +1,756 @@
+flashcards/ (project root)
+
+Below are the exact files to create. Copy each block into files with the same paths.
+
+⸻
+
+app.py
+
+# app.py
+# streamlit app for a beginner-friendly ai flashcard generator
+# all comments are lowercase and informal
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+from pathlib import Path
+from typing import List, Dict
+
+import pandas as pd
+import streamlit as st
+
+from utils.parsing import read_file, clean_text
+from utils.chunking import estimate_tokens, chunk_text
+from utils.llm import generate_flashcards
+from utils.formatting import cards_to_dataframe, validate_cards
+from utils.export import to_csv_bytes, to_anki_txt_bytes
+
+APP_TITLE = "FlashcardGPT"
+APP_TAGLINE = "turn your notes into testable q/a cards, fast"
+GITHUB_URL = "https://github.com/yourname/flashcards"  # placeholder link
+MAX_FILE_MB = 10
+
+# ----- page config -----
+st.set_page_config(page_title=APP_TITLE, page_icon="🃏", layout="wide")
+
+# ----- small header -----
+left, mid, right = st.columns([0.6, 0.25, 0.15])
+with left:
+    st.markdown(f"### 🃏 {APP_TITLE}\n{APP_TAGLINE}")
+with mid:
+    st.markdown("\n")
+with right:
+    st.markdown(f"[github repo]({GITHUB_URL})")
+
+# ----- session state init -----
+if "raw_text" not in st.session_state:
+    st.session_state.raw_text = ""
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+if "cards_df" not in st.session_state:
+    st.session_state.cards_df = pd.DataFrame(columns=["question", "answer", "source_chunk"])
+if "gen_running" not in st.session_state:
+    st.session_state.gen_running = False
+
+# ----- sidebar: settings -----
+st.sidebar.header("settings")
+api_key_input = st.sidebar.text_input(
+    "openai api key",
+    type="password",
+    help="your key is stored only in this session. you can also set the OPENAI_API_KEY env var.",
+    value=os.getenv("OPENAI_API_KEY", ""),
+)
+
+n_per_chunk = st.sidebar.number_input("cards per chunk", min_value=1, max_value=10, value=4, step=1)
+
+temp = st.sidebar.slider("temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
+
+max_total_cards = st.sidebar.number_input("max total cards", min_value=10, max_value=200, value=60, step=5)
+
+skip_short = st.sidebar.toggle("skip chunks shorter than 200 chars", value=True)
+
+topics_hint = st.sidebar.text_input(
+    "topics (optional)",
+    value="",
+    help="comma-separated topics to steer the questions (nice-to-have)",
+)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("new session / clear", use_container_width=True):
+    st.session_state.raw_text = ""
+    st.session_state.chunks = []
+    st.session_state.cards_df = pd.DataFrame(columns=["question", "answer", "source_chunk"])
+    st.session_state.gen_running = False
+    st.toast("session cleared.")
+
+# ----- main: input area -----
+st.subheader("1) upload notes or paste text")
+col1, col2 = st.columns([0.55, 0.45])
+
+with col1:
+    uploaded = st.file_uploader(
+        "upload a pdf / docx / txt (<= ~10mb)", type=["pdf", "docx", "txt"], accept_multiple_files=False
+    )
+    if uploaded is not None:
+        size_mb = uploaded.size / (1024 * 1024)
+        if size_mb > MAX_FILE_MB:
+            st.error(f"file too big: {size_mb:.1f} mb (limit {MAX_FILE_MB} mb)")
+        else:
+            try:
+                text = read_file(uploaded)
+                text = clean_text(text)
+                st.session_state.raw_text = text
+                st.success("file parsed successfully")
+            except Exception as e:
+                st.error(f"could not parse file: {e}")
+
+with col2:
+    pasted = st.text_area(
+        "or paste text here",
+        value=st.session_state.raw_text,
+        height=220,
+        placeholder="paste your notes...",
+    )
+    if pasted != st.session_state.raw_text:
+        st.session_state.raw_text = pasted
+
+# ----- preview + token estimate -----
+st.subheader("2) preview & token estimate")
+raw_text = st.session_state.raw_text or ""
+char_count = len(raw_text)
+
+colA, colB, colC = st.columns(3)
+with colA:
+    st.metric("characters", f"{char_count:,}")
+with colB:
+    token_est = estimate_tokens(raw_text)
+    st.metric("estimated tokens", f"{token_est:,}")
+with colC:
+    st.metric("approx pages", f"{max(1, char_count // 1800)}")
+
+if raw_text:
+    preview = raw_text[:1200]
+    with st.expander("show preview (first 1200 chars)"):
+        st.code(preview)
+else:
+    st.info("upload or paste some notes to continue.")
+
+# ----- chunking -----
+st.subheader("3) chunking")
+if st.button("chunk notes", disabled=not bool(raw_text)):
+    st.session_state.chunks = chunk_text(raw_text, target_tokens=1400, overlap_tokens=150)
+    if skip_short:
+        st.session_state.chunks = [c for c in st.session_state.chunks if len(c.strip()) >= 200]
+    st.toast(f"created {len(st.session_state.chunks)} chunk(s)")
+
+if st.session_state.chunks:
+    st.write(f"we have **{len(st.session_state.chunks)}** chunks ready to generate cards from.")
+    with st.expander("show chunk boundaries"):
+        for i, c in enumerate(st.session_state.chunks):
+            st.markdown(f"**chunk {i}** — ~{estimate_tokens(c)} tokens\n\n{c[:400]}…")
+
+# ----- generation -----
+st.subheader("4) generate flashcards")
+
+def _need_key() -> bool:
+    return not (api_key_input or os.getenv("OPENAI_API_KEY"))
+
+if st.button("generate flashcards", type="primary", disabled=not st.session_state.chunks):
+    if _need_key():
+        st.error("please provide an openai api key in the sidebar.")
+    else:
+        st.session_state.gen_running = True
+        progress = st.progress(0)
+        status = st.empty()
+        try:
+            cards = generate_flashcards(
+                chunks=st.session_state.chunks,
+                n_per_chunk=int(n_per_chunk),
+                api_key=api_key_input or os.getenv("OPENAI_API_KEY"),
+                temperature=float(temp),
+                cap_total=int(max_total_cards),
+                topics=[t.strip() for t in topics_hint.split(",") if t.strip()] if topics_hint else None,
+                progress_cb=lambda done, total: (progress.progress(min(1.0, done / total)), status.write(f"processing chunk {done}/{total}")),
+            )
+            df = cards_to_dataframe(cards)
+            st.session_state.cards_df = df
+            st.success(f"generated {len(df)} cards")
+        except Exception as e:
+            st.error(f"failed to generate: {e}")
+        finally:
+            st.session_state.gen_running = False
+            progress.progress(1.0)
+            status.write("done")
+
+# ----- review & edit -----
+st.subheader("5) review & edit")
+if st.session_state.cards_df is not None and not st.session_state.cards_df.empty:
+    edited = st.data_editor(
+        st.session_state.cards_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "question": st.column_config.TextColumn("question", help="front of card"),
+            "answer": st.column_config.TextColumn("answer", help="back of card"),
+            "source_chunk": st.column_config.NumberColumn("source_chunk", help="origin index"),
+        },
+        hide_index=True,
+        key="cards_editor",
+    )
+    st.session_state.cards_df = edited
+
+    ok, msg = validate_cards(edited)
+    if not ok:
+        st.warning(msg)
+
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("regenerate all", disabled=not st.session_state.chunks):
+            st.session_state.cards_df = pd.DataFrame(columns=["question", "answer", "source_chunk"])
+            st.experimental_rerun()
+    with cols[1]:
+        st.caption("to regenerate specific chunks, re-run generation after trimming your notes to those sections.")
+    with cols[2]:
+        if st.button("delete selected rows"):
+            # streamlit doesn't have native row selection; users can blank rows; here we drop totally empty ones
+            mask = ~((edited["question"].fillna("") == "") & (edited["answer"].fillna("") == ""))
+            st.session_state.cards_df = edited[mask]
+            st.toast("empty rows removed")
+else:
+    st.info("no cards yet. generate to see them here.")
+
+# ----- export -----
+st.subheader("6) export")
+if st.session_state.cards_df is not None and not st.session_state.cards_df.empty:
+    df = st.session_state.cards_df[["question", "answer", "source_chunk"]].copy()
+
+    # csv
+    csv_bytes = to_csv_bytes(df.rename(columns={"question": "front", "answer": "back"}))
+    st.download_button(
+        label="download CSV (front,back)",
+        data=csv_bytes,
+        file_name="flashcards.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # anki plain text (tab separated)
+    anki_bytes = to_anki_txt_bytes(df)
+    st.download_button(
+        label="download anki txt (tab-separated)",
+        data=anki_bytes,
+        file_name="flashcards_anki.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+    # copy-to-clipboard workaround: show content in a text area for user to copy
+    st.markdown("**copy-paste for quizlet/anki:**")
+    text_blob = "\n".join([f"{q}\t{a}" for q, a in df[["question", "answer"]].itertuples(index=False)])
+    st.text_area("select and copy", value=text_blob, height=160)
+else:
+    st.info("no cards to export yet.")
+
+# ----- notes -----
+st.markdown("---")
+st.markdown(
+    "**privacy & cost tips:**\n\n"
+    "- your notes are processed locally to create chunks; only the chunks are sent to openai to make cards.\n"
+    "- use the *max total cards* setting to control api usage.\n"
+    "- keep temperature low (0.2) for factual notes.\n"
+)
+
+st.markdown(
+    "**how to run locally:** open the README from the repo or see below."
+)
+
+with st.expander("quickstart (local)"):
+    st.code(
+        """
+python -m venv .venv
+source .venv/bin/activate   # windows: .venv\\Scripts\\activate
+pip install -r requirements.txt
+export OPENAI_API_KEY="YOUR_KEY"  # windows: set OPENAI_API_KEY=YOUR_KEY
+streamlit run app.py
+"""
+    )
+
+
+⸻
+
+requirements.txt
+
+streamlit
+pypdf
+python-docx
+tiktoken
+openai>=1.0.0
+pandas
+
+
+⸻
+
+README.md
+
+# 🃏 FlashcardGPT - AI Flashcard Generator (Streamlit + OpenAI)
+
+Turn your notes (PDF/DOCX/TXT or pasted text) into **high‑quality Q/A flashcards** you can edit and export to CSV/Anki.
+
+![screenshot placeholder](docs/screenshot.png)
+
+## Features
+- Upload **PDF/DOCX/TXT** or paste text
+- Live **character + token** estimate
+- **Smart chunking** (~1200–1600 tokens, 150‑token overlap)
+- LLM card generation with **guardrails** (answers only from notes)
+- Inline **review & edit** table
+- Export to **CSV** (front,back) or **Anki TXT** (tab‑separated)
+- Session state + **Clear** button
+- Dark theme UI
+
+## Quickstart
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # windows: .venv\Scripts\activate
+pip install -r requirements.txt
+export OPENAI_API_KEY="YOUR_KEY"  # windows: set OPENAI_API_KEY=YOUR_KEY
+streamlit run app.py
+
+you can also paste the API key in the app sidebar (not saved to disk).
+
+Configuration
+	•	Temperature default 0.2
+	•	Cards per chunk default 4
+	•	Max total cards default 60
+	•	Optional topics steering (comma‑separated)
+
+Deployment
+	•	Streamlit Community Cloud: push to GitHub → “New app” → pick repo → main file app.py → add OPENAI_API_KEY in Secrets (or leave user‑provided)
+	•	Alternatives: Render, Railway. (Vercel is better for JS; for Python, Streamlit Cloud is simplest.)
+
+Acceptance Tests
+	1.	Upload sample/sample_notes.txt → generate 20–40 cards without errors
+	2.	Paste text of ~10,000 chars → chunking happens; total cards capped by settings
+	3.	Delete some cards and export → CSV opens in Excel; Anki TXT imports
+	4.	Toggle temperature and cards per chunk and regenerate
+	5.	Remove API key → friendly error appears
+	6.	PDF and DOCX both parse
+
+Notes
+	•	The app only sends chunks to OpenAI, not full files. Keep sensitive data out of your notes if unsure.
+	•	Token estimates use tiktoken.
+
+License
+
+MIT
+
+---
+
+## .streamlit/config.toml
+
+```toml
+[theme]
+base="dark"
+primaryColor="#7C3AED"
+backgroundColor="#0B0F19"
+secondaryBackgroundColor="#121826"
+textColor="#E5E7EB"
+
+
+⸻
+
+utils/parsing.py
+
+# utils/parsing.py
+# file reading + basic cleanup helpers
+
+from __future__ import annotations
+
+import io
+import re
+from typing import Any
+
+from pypdf import PdfReader
+from docx import Document
+
+
+def read_file(uploaded_file: Any) -> str:
+    """auto-detect by extension and extract text; raise helpful error on failure."""
+    name = getattr(uploaded_file, "name", "uploaded")
+    lower = name.lower()
+
+    if lower.endswith(".pdf"):
+        try:
+            reader = PdfReader(uploaded_file)
+            pages = []
+            for p in reader.pages:
+                pages.append(p.extract_text() or "")
+            text = "\n\n".join(pages)
+            if not text.strip():
+                raise ValueError("pdf text extraction returned empty text")
+            return text
+        except Exception as e:
+            raise RuntimeError(f"pdf parsing failed: {e}")
+
+    if lower.endswith(".docx"):
+        try:
+            doc = Document(uploaded_file)
+            text = "\n".join([p.text for p in doc.paragraphs])
+            if not text.strip():
+                raise ValueError("docx appears to contain no readable paragraphs")
+            return text
+        except Exception as e:
+            raise RuntimeError(f"docx parsing failed: {e}")
+
+    if lower.endswith(".txt"):
+        try:
+            content = uploaded_file.read()
+            if isinstance(content, bytes):
+                try:
+                    return content.decode("utf-8")
+                except UnicodeDecodeError:
+                    return content.decode("latin-1", errors="ignore")
+            return str(content)
+        except Exception as e:
+            raise RuntimeError(f"txt read failed: {e}")
+
+    raise ValueError("unsupported file type. use pdf, docx, or txt")
+
+
+def clean_text(text: str) -> str:
+    """normalize whitespace and remove obvious repeated headers/footers."""
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    # collapse excessive spaces
+    s = re.sub(r"\u00a0", " ", s)  # non-breaking space
+    s = re.sub(r"[ \t]+", " ", s)
+    # dedupe newlines to max 2
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    # try to remove super-common short lines (likely headers/footers)
+    lines = [ln.strip() for ln in s.split("\n")]
+    freq = {}
+    for ln in lines:
+        if 0 < len(ln) <= 60:
+            freq[ln] = freq.get(ln, 0) + 1
+    repeated = {k for k, v in freq.items() if v >= 3}
+    if repeated:
+        lines = [ln for ln in lines if ln not in repeated]
+    s = "\n".join(lines)
+
+    return s.strip()
+
+
+⸻
+
+utils/chunking.py
+
+# utils/chunking.py
+# token estimation and chunking logic
+
+from __future__ import annotations
+
+import re
+from typing import List
+
+import tiktoken
+
+
+def _get_encoder():
+    # cl100k_base matches gpt-4/3.5 families reasonably well
+    try:
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return tiktoken.get_encoding("p50k_base")
+
+
+def estimate_tokens(text: str) -> int:
+    enc = _get_encoder()
+    return len(enc.encode(text or ""))
+
+
+def _split_candidates(text: str) -> List[str]:
+    # split by markdown-ish headings or all-caps lines first
+    parts = re.split(r"(?m)^(?:#{1,6} .*|[A-Z0-9][A-Z0-9 \-]{6,})\n", text)
+    if len(parts) > 1:
+        return [p.strip() for p in parts if p.strip()]
+    # then by paragraphs
+    paras = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
+    if len(paras) > 1:
+        return paras
+    # fallback: sentences via simple regex
+    sents = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in sents if s.strip()]
+
+
+def chunk_text(text: str, target_tokens: int = 1400, overlap_tokens: int = 150) -> List[str]:
+    """greedily pack chunks up to ~target tokens, with overlap between chunks.
+    we prefer to add whole paragraphs/sections when possible.
+    """
+    enc = _get_encoder()
+    units = _split_candidates(text)
+
+    chunks: List[str] = []
+    cur: List[str] = []
+    cur_tok = 0
+
+    for unit in units:
+        utoks = len(enc.encode(unit))
+        if cur_tok + utoks <= target_tokens:
+            cur.append(unit)
+            cur_tok += utoks
+        else:
+            if cur:
+                chunks.append("\n\n".join(cur))
+            # start new chunk, but try to add overlap from end of previous chunk
+            if chunks:
+                last = chunks[-1]
+                last_tokens = enc.encode(last)
+                # take the last overlap_tokens of previous chunk as overlap
+                overlap_slice = enc.decode(last_tokens[max(0, len(last_tokens)-overlap_tokens):])
+                cur = [overlap_slice, unit]
+                cur_tok = len(enc.encode(overlap_slice)) + utoks
+            else:
+                cur = [unit]
+                cur_tok = utoks
+
+            # if a single unit is gigantic, we hard-split it by tokens
+            while cur_tok > target_tokens * 1.3:
+                toks = enc.encode("\n\n".join(cur))
+                part = enc.decode(toks[:target_tokens])
+                rest = enc.decode(toks[target_tokens - overlap_tokens:])
+                chunks.append(part)
+                cur = [rest]
+                cur_tok = len(enc.encode(rest))
+
+    if cur:
+        chunks.append("\n\n".join(cur))
+
+    return chunks
+
+
+⸻
+
+utils/llm.py
+
+# utils/llm.py
+# openai calls and response validation
+
+from __future__ import annotations
+
+import json
+from typing import List, Dict, Callable, Optional
+
+from openai import OpenAI
+
+SYSTEM_PROMPT = (
+    "you create study flashcards from user-provided notes. ask clear, testable questions and give "
+    "precise answers only from the notes. avoid trivia; focus on core concepts, definitions, processes, "
+    "diagrams, and cause→effect. if info isn’t in the notes, say “not found in notes.”"
+)
+
+USER_TEMPLATE = (
+    "notes chunk:\n---\n{chunk_text}\n---\n\n"
+    "create {n_cards_per_chunk} high-quality flashcards as json with keys: question, answer.\n"
+    "keep questions short but specific. prefer “why/how/compare” when useful.\n"
+    "do not invent facts beyond the notes.\n"
+    "{topic_hint}"
+)
+
+
+def _build_prompt(chunk: str, n: int, topics: Optional[List[str]]) -> str:
+    topic_hint = ""
+    if topics:
+        topic_hint = "focus on these topics if present: " + ", ".join(topics) + "\n"
+    return USER_TEMPLATE.format(chunk_text=chunk, n_cards_per_chunk=n, topic_hint=topic_hint)
+
+
+def _parse_cards(raw: str, chunk_idx: int) -> List[Dict]:
+    # try to load as json array; if object with key, unwrap; else try to find json in string
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # try to locate the first json array
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            data = json.loads(raw[start:end+1])
+        else:
+            raise ValueError("model did not return valid json")
+
+    if isinstance(data, dict):
+        # common pattern: {"flashcards": [...]}
+        for k in data:
+            if isinstance(data[k], list):
+                data = data[k]
+                break
+
+    if not isinstance(data, list):
+        raise ValueError("json root is not a list")
+
+    out = []
+    for item in data:
+        q = (item.get("question") if isinstance(item, dict) else None) or ""
+        a = (item.get("answer") if isinstance(item, dict) else None) or ""
+        q = q.strip()
+        a = a.strip()
+        if q and a:
+            out.append({"question": q, "answer": a, "source_chunk": chunk_idx})
+    return out
+
+
+def generate_flashcards(
+    chunks: List[str],
+    n_per_chunk: int,
+    api_key: str,
+    temperature: float,
+    cap_total: int,
+    topics: Optional[List[str]] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> List[Dict]:
+    """loop over chunks and collect flashcards until cap is reached."""
+    client = OpenAI(api_key=api_key)
+
+    all_cards: List[Dict] = []
+    total = len(chunks)
+
+    for i, chunk in enumerate(chunks):
+        if progress_cb:
+            progress_cb(i, total)
+        if len(all_cards) >= cap_total:
+            break
+
+        user_prompt = _build_prompt(chunk, n_per_chunk, topics)
+
+        # first try
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=float(temperature),
+            top_p=1.0,
+            max_tokens=900,
+        )
+        text = resp.choices[0].message.content or ""
+
+        try:
+            cards = _parse_cards(text, i)
+        except Exception:
+            # retry once with explicit json-only reminder
+            retry_user = user_prompt + "\nrespond JSON only."
+            resp2 = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": retry_user},
+                ],
+                temperature=float(temperature),
+                top_p=1.0,
+                max_tokens=900,
+            )
+            text = resp2.choices[0].message.content or ""
+            cards = _parse_cards(text, i)
+
+        # trim if we exceed cap
+        remaining = cap_total - len(all_cards)
+        if remaining <= 0:
+            break
+        all_cards.extend(cards[:remaining])
+
+    # final progress update
+    if progress_cb:
+        progress_cb(total, total)
+
+    return all_cards
+
+
+⸻
+
+utils/formatting.py
+
+# utils/formatting.py
+# dataframe helpers and simple validation
+
+from __future__ import annotations
+
+import pandas as pd
+from typing import List, Dict, Tuple
+
+
+def cards_to_dataframe(cards: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(cards)
+    if df.empty:
+        return pd.DataFrame(columns=["question", "answer", "source_chunk"])
+    # enforce column order
+    df = df[["question", "answer", "source_chunk"]]
+    return df
+
+
+def validate_cards(df: pd.DataFrame) -> Tuple[bool, str]:
+    if df.empty:
+        return False, "no cards to show yet"
+    # basic length checks to avoid super-long sides
+    long_q = df["question"].fillna("").str.len().max()
+    long_a = df["answer"].fillna("").str.len().max()
+    if long_q > 600:
+        return False, "some questions are too long (>600 chars). try editing or regenerating."
+    if long_a > 1500:
+        return False, "some answers are very long (>1500 chars). consider trimming."
+    if (df[["question", "answer"]].fillna("") == "").any().any():
+        return False, "found empty question/answer cells. fill or delete them before exporting."
+    return True, "ok"
+
+
+⸻
+
+utils/export.py
+
+# utils/export.py
+# export helpers for csv and anki text
+
+from __future__ import annotations
+
+import io
+import pandas as pd
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.StringIO()
+    out = df[["front", "back"]] if set(["front", "back"]).issubset(df.columns) else df[["question", "answer"]].rename(columns={"question": "front", "answer": "back"})
+    out.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+def to_anki_txt_bytes(df: pd.DataFrame) -> bytes:
+    out = df[["question", "answer"]]
+    lines = [f"{q}\t{a}" for q, a in out.itertuples(index=False)]
+    txt = "\n".join(lines)
+    return txt.encode("utf-8")
+
+
+⸻
+
+sample/sample_notes.txt
+
+photosynthesis basics\n\nphotosynthesis converts light energy into chemical energy stored in glucose. it occurs mainly in chloroplasts of plant cells. there are two major stages: the light-dependent reactions and the calvin cycle (light-independent reactions).\n\nlight-dependent reactions take place in the thylakoid membranes. chlorophyll absorbs photons, exciting electrons that move through an electron transport chain, generating atp and nadph. water is split (photolysis) to replace electrons, releasing oxygen.\n\ncalvin cycle occurs in the stroma. it fixes co2 using rubisco, forming g3p through reduction and regeneration phases. atp and nadph from the light reactions power these steps. some g3p exits to build glucose and other carbohydrates.\n\nlimitations include light intensity, co2 concentration, temperature, and water availability. different pathways (c3, c4, cam) adapt to environmental conditions.\n```
+
+---
+
+## sample/sample_output.csv
+
+```csv
+front,back
+What are the two main stages of photosynthesis?,Light-dependent reactions and the Calvin cycle (light-independent reactions).
+Where do the light-dependent reactions occur?,In the thylakoid membranes of chloroplasts.
+Which molecules provide energy and reducing power for the Calvin cycle?,ATP provides energy and NADPH provides reducing power.
+Why is water split during the light reactions?,To replace electrons lost by chlorophyll; oxygen is released as a byproduct.
+
+
+⸻
+
+end of files
